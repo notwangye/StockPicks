@@ -216,6 +216,75 @@ def _check_and_trigger_immediate_run(scheduler):
     scheduler.modify_job('data_update', next_run_time=now)
 
 
+def _check_and_trigger_fiscal_recovery(scheduler):
+    """启动时检查季度财务任务是否错过；如果错过则立即补跑
+
+    季度财务任务每年只在 5/9/11 月 10 号 02:00 触发一次。
+    如果服务当时宕机或被跳过，misfire_grace_time=3600 不足以恢复。
+    兜底策略：服务启动时检查当前是否在错峰窗口（5/9/11 月 11~25 号），
+    且抽样检查目标季度的数据覆盖率 < 80%，则立即触发 fiscal_update。
+
+    这样：
+      - 任务当天正常完成 → 不再触发（避免重复跑）
+      - 任务错过 → 启动时自动补跑
+      - 每月 25 号之后 → 不再触发（避免误补老季度）
+    """
+    now = datetime.now()
+    recovery_months = (5, 9, 11)
+
+    if now.month not in recovery_months:
+        return
+    # 仅在错峰后的 11~25 号兜底
+    if now.day < 11 or now.day > 25:
+        return
+
+    # 推断本次应补的季度
+    if now.month == 5:
+        targets = [(now.year, 1), (now.year - 1, 4)]
+    elif now.month == 9:
+        targets = [(now.year, 2)]
+    else:  # 11
+        targets = [(now.year, 3)]
+
+    # 抽样 50 只股票检查目标季度覆盖率
+    from jobs.fiscal_job import _fmt_date, FISCAL_DIR, get_codes
+    try:
+        codes = get_codes()
+        if not codes:
+            return
+        sample = codes[:50]
+        covered = 0
+        for code in sample:
+            fp = FISCAL_DIR / f"{code}.json"
+            if not fp.exists():
+                continue
+            try:
+                import json as _json
+                d = _json.loads(fp.read_text(encoding="utf-8"))
+                dates = {q.get("report_date") for q in d.get("fiscal", [])}
+                if all(_fmt_date(y, q) in dates for y, q in targets):
+                    covered += 1
+            except Exception:
+                pass
+        coverage = covered / len(sample) if sample else 1.0
+    except Exception as e:
+        logger.warning(f"[启动检查] 财务覆盖率检查失败: {e}")
+        return
+
+    if coverage >= 0.8:
+        logger.info(
+            f"[启动检查] 季度财务任务目标季度覆盖率 {coverage:.0%}，"
+            f"认为已补齐，跳过启动兜底"
+        )
+        return
+
+    logger.warning(
+        f"[启动检查] 季度财务任务目标季度覆盖率仅 {coverage:.0%}，"
+        f"判定为错过任务，立即补跑 fiscal_update"
+    )
+    scheduler.modify_job('fiscal_update', next_run_time=now)
+
+
 def start_scheduler():
     """启动定时任务调度器"""
     scheduler = BackgroundScheduler(timezone='Asia/Shanghai')
@@ -267,7 +336,7 @@ def start_scheduler():
         name='季度财务数据补全',
         coalesce=True,
         max_instances=1,
-        misfire_grace_time=3600  # 允许最多延迟1小时，避免深夜任务被跳过
+        misfire_grace_time=86400 * 15  # 允许最多延迟15天执行（季度任务罕见触发，错过需补）
     )
     logger.info("调度任务已注册: 每年5/9/11月10号 02:00 (季度财务数据补全)")
 
@@ -278,6 +347,9 @@ def start_scheduler():
 
     # 如果现在是交易日且在17:30-19:00延迟期内，立即触发一次数据更新
     _check_and_trigger_immediate_run(scheduler)
+
+    # 如果本季度财务任务错过且目标季度未补齐，立即触发补跑
+    _check_and_trigger_fiscal_recovery(scheduler)
 
     return scheduler
 

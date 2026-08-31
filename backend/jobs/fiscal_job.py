@@ -40,7 +40,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 FISCAL_DIR: Path = get_fiscal_data_dir()
-FISCAL_DIR.mkdir(parents=True, exist_ok=True)
+# 兼容 NTFS junction（参考 news_job.py 修复 #3451da6）：
+# 在 Windows 下 FISCAL_DIR 可能指向老项目的 junction，
+# 此时 exists() 返回 False 但 mkdir(exist_ok=True) 仍会触发 WinError 183。
+if not FISCAL_DIR.exists() and not FISCAL_DIR.is_junction():
+    try:
+        FISCAL_DIR.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
 
 # 历史数据目录（用于获取股票代码列表 + 名称）
 HISTORICAL_DIR: Path = Path(os.environ.get(
@@ -49,9 +56,16 @@ HISTORICAL_DIR: Path = Path(os.environ.get(
 ))
 
 # 并发控制
-WORKERS = 20            # 股票并发数
-INNER_WORKERS = 50      # 单股票内部季度并发数（baostock 每线程独立连接）
+#   修复: 实测 baostock 在并发 / 网络抖动下大量 "接收数据异常 / 服务器连接失败"
+#   主动降低并发 + 默认走 akshare 主源（一次性返回所有季度，更稳定）
+WORKERS = 8             # 股票并发数
+INNER_WORKERS = 5       # 单股票内部季度并发数（baostock 每线程独立连接）
 FILE_LOCK_TIMEOUT = 30  # 文件锁超时秒数
+
+# 数据源策略
+#   "akshare_first": akshare 优先（默认；baostock 兜底补字段缺失）
+#   "baostock_first": baostock 优先（兜底 akshare）
+PRIMARY_SOURCE = "akshare_first"
 
 # 线程本地 baostock 连接
 _tls = threading.local()
@@ -127,20 +141,43 @@ def _bs():
 
 
 def _query_bs(code: str, year: int, quarter: int, tbl: str) -> Dict[str, dict]:
-    """baostock 单表查询，返回 {statDate: row}"""
-    bs = _bs()
+    """baostock 单表查询，返回 {statDate: row}
+
+    带重试：实测 baostock 在并发 / 网络抖动时会随机失败
+      ('接收数据异常，请稍后再试', '服务器连接失败', WinError 10057)
+    失败时重新 login 再查，最多重试 2 次
+    """
     fn_map = {
-        "profit": bs.query_profit_data,
-        "balance": bs.query_balance_data,
-        "dupont": bs.query_dupont_data,
+        "profit": "query_profit_data",
+        "balance": "query_balance_data",
+        "dupont": "query_dupont_data",
     }
-    fn = fn_map[tbl]
-    rs = fn(code=code, year=str(year), quarter=str(quarter))
-    rows = {}
-    while rs.next():
-        r = dict(zip(rs.fields, rs.get_row_data()))
-        rows[r.get("statDate", "")] = r
-    return rows
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            bs = _bs()
+            fn = getattr(bs, fn_map[tbl])
+            rs = fn(code=code, year=str(year), quarter=str(quarter))
+            rows = {}
+            while rs.next():
+                r = dict(zip(rs.fields, rs.get_row_data()))
+                rows[r.get("statDate", "")] = r
+            return rows
+        except Exception as e:
+            last_err = e
+            logger.debug(f"baostock {code} {year}Q{quarter} {tbl} 第{attempt+1}次失败: {e}")
+            # 重连 baostock
+            try:
+                import baostock as _bs_mod
+                _bs_mod.logout()
+            except Exception:
+                pass
+            if hasattr(_tls, "bs"):
+                del _tls.bs
+            time.sleep(0.5 * (attempt + 1))
+    if last_err:
+        raise last_err
+    return {}
 
 
 def _parse_bs_records(
@@ -391,7 +428,11 @@ def fetch_from_akshare(
 # ============================================================
 
 LOCK_DIR: Path = FISCAL_DIR / ".locks"
-LOCK_DIR.mkdir(parents=True, exist_ok=True)
+if not LOCK_DIR.exists() and not LOCK_DIR.is_junction():
+    try:
+        LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
 
 
 def _acquire_file_lock(lock_path: Path, timeout: int = FILE_LOCK_TIMEOUT) -> bool:
@@ -552,37 +593,56 @@ def run_fiscal_update(
 
 
 def _process_one(code: str, targets: List[Tuple[int, int]]) -> int:
-    """单股票处理：baostock → akshare 兜底 → 写入
+    """单股票处理：按 PRIMARY_SOURCE 决定主源 → 另一源补字段 → 写入
 
     字段合并策略：
-      1. baostock 拉一轮（可能在某些字段上有缺失）
-      2. akshare 拉一轮（覆盖全字段，作为补集/追加）
-      3. 以 bs_records 为底，akshare 只补 baostock 缺失的字段
+      1. 主源拉一轮（覆盖大部分字段）
+      2. 备源拉一轮（只补主源缺失的字段，不覆盖已有）
+      3. 写入磁盘
+
+    注意：akshare_first 模式下默认跳过 baostock 兜底（实测 baostock 高并发
+    下被限流，5000+ 股票场景 80% 请求失败 + 重试拖慢整体速度）。
+    如需 baostock 兜底，设置环境变量 FISCAL_DUAL_SOURCE=1
     """
     target_dates = {_fmt_date(y, q) for y, q in targets}
+    use_dual = os.environ.get("FISCAL_DUAL_SOURCE", "0") == "1"
 
-    # 1. baostock 主源
-    bs_records = fetch_from_baostock(code, targets)
-    # 仅保留本次目标季度（防御性过滤）
-    bs_records = {rp: r for rp, r in bs_records.items() if rp in target_dates}
+    if PRIMARY_SOURCE == "akshare_first":
+        primary_records = fetch_from_akshare(code, targets)
+        primary_records = {rp: r for rp, r in primary_records.items() if rp in target_dates}
+        records = primary_records
 
-    # 2. akshare 全面补全（以“字段集”为补集，不以“季度”为单位）
-    #    - 为所有目标季度调用，akshare 返回全字段
-    #    - 只补 baostock 缺的字段，不覆盖 baostock 已有的字段
-    aks_records = fetch_from_akshare(code, targets)
-    for rp, aks_rec in aks_records.items():
-        if rp not in target_dates:
-            continue
-        existing_rec = bs_records.get(rp, {})
-        # akshare 提供但 baostock 未给的字段
-        for k, v in aks_rec.items():
-            if k not in existing_rec:
-                existing_rec[k] = v
-        bs_records.setdefault(rp, existing_rec)
-        bs_records[rp] = existing_rec
+        if use_dual:
+            # 仅在显式启用时调用 baostock 兜底
+            try:
+                bs_records = fetch_from_baostock(code, targets)
+                bs_records = {rp: r for rp, r in bs_records.items() if rp in target_dates}
+                for rp, bs_rec in bs_records.items():
+                    existing_rec = records.get(rp, {})
+                    for k, v in bs_rec.items():
+                        if k not in existing_rec:
+                            existing_rec[k] = v
+                    records.setdefault(rp, existing_rec)
+                    records[rp] = existing_rec
+            except Exception as e:
+                logger.debug(f"baostock 兜底 {code} 失败: {e}")
+    else:
+        # baostock 优先：旧逻辑保留
+        bs_records = fetch_from_baostock(code, targets)
+        bs_records = {rp: r for rp, r in bs_records.items() if rp in target_dates}
+        aks_records = fetch_from_akshare(code, targets)
+        for rp, aks_rec in aks_records.items():
+            if rp not in target_dates:
+                continue
+            existing_rec = bs_records.get(rp, {})
+            for k, v in aks_rec.items():
+                if k not in existing_rec:
+                    existing_rec[k] = v
+            bs_records.setdefault(rp, existing_rec)
+            bs_records[rp] = existing_rec
+        records = bs_records
 
-    # 3. 写入
-    return _save(code, bs_records)
+    return _save(code, records)
 
 
 # ============================================================
@@ -604,7 +664,16 @@ if __name__ == "__main__":
 
     current = datetime.now()
     if args.month:
-        current = current.replace(month=args.month)
+        # 修复: replace(month=X) 在当前 day 超出目标月份天数时会抛 ValueError
+        #   例: 8 月 31 日调用 --month 2 → 2 月没有 31 日 → ValueError
+        # 改用 date() 构造再合并时间
+        from datetime import date as _date
+        today = current.date()
+        try:
+            new_day = min(today.day, 28)  # 28 日任何月份都安全
+            current = datetime(today.year, args.month, new_day, current.hour, current.minute, current.second)
+        except ValueError:
+            current = datetime(today.year, args.month, 1, current.hour, current.minute, current.second)
     code_list = args.codes.split(",") if args.codes else None
 
     run_fiscal_update(current_date=current, codes=code_list)

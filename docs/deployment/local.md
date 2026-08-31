@@ -125,8 +125,23 @@ STOCK_PICKS_DATA=/your/custom/path
 > - 数据源：baostock（主，稳定免费）→ akshare（兜底，覆盖更全）
 > - 范围：所有 A 股（5000+）
 > - 模块：`backend/jobs/fiscal_job.py`
+> - 错过兜底：服务启动时自动检查目标季度覆盖率 < 80% 则立即补跑（仅 5/9/11 月 11~25 号）
 >
 > 所有任务时区为 `Asia/Shanghai`，使用 `apscheduler` `BackgroundScheduler`。
+
+### 手动补齐季度财报
+
+```bash
+# 补齐当年半年报（9 月应在 9/10 后跑；其余月份手动跑也会按 get_target_quarters 兜底）
+cd backend
+STOCK_PICKS_DATA=D:/stock-picks/data/historical \
+  python jobs/fiscal_job.py --month 9
+
+# 指定股票子集（调试用）
+python jobs/fiscal_job.py --month 9 --codes 000001,600519
+```
+
+> ⚠️ `--month` 仅影响季度选择，不会改写财务字段。补齐是**增量**的——已存在的 `report_date` 不会重复写入。
 
 关闭定时任务: 设置环境变量 `ENABLE_SCHEDULER=false`
 
