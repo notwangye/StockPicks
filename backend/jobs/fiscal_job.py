@@ -439,6 +439,72 @@ if not LOCK_DIR.exists() and not LOCK_DIR.is_junction():
         pass
 
 
+# ============================================================
+# 数据校验（防止异常值写入）
+# ============================================================
+
+# A 股字段合理范围（参考东方财富历史数据极值）
+#   营收: [-1e11, 1e12] (亏损 -100 亿 ~ 1 万亿)
+#   净利: [-1e11, 1e11] (-100 亿 ~ 100 亿)
+#   总股本: [1e7, 1e12] (1000 万股 ~ 1 万亿股)
+#   每股净资产: [-100, 1000] 元
+#   资产负债率: [0, 100] %
+_VALID_RANGES = {
+    "营业总收入": (-1e11, 1e12),
+    "归母净利润": (-1e11, 1e11),
+    "扣非净利润": (-1e11, 1e11),
+    "每股净资产": (-100.0, 1000.0),
+    "总股本": (1e7, 1e12),
+    "流通股本": (0, 1e12),
+    "资产负债率": (0.0, 100.0),
+}
+
+
+def _sanitize_record(code: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+    """过滤单条记录中的异常字段值
+
+    校验规则：
+      1. 字段值在 _VALID_RANGES 范围内 → 保留
+      2. 字段值超出范围 → 删除该字段并记录警告
+      3. 字段值非数值（字符串/None）→ 跳过校验保留原值
+
+    Returns:
+        清洗后的 dict
+    """
+    cleaned = {}
+    for k, v in rec.items():
+        if k in _VALID_RANGES and isinstance(v, (int, float)):
+            lo, hi = _VALID_RANGES[k]
+            if lo <= v <= hi:
+                cleaned[k] = v
+            else:
+                logger.warning(
+                    f"[数据校验] {code} {k}={v} 超出合理范围 [{lo}, {hi}], 丢弃该字段"
+                )
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+def _safe_json_load(path: Path) -> Optional[Dict[str, Any]]:
+    """安全加载 JSON 文件，损坏时返回 None 而非抛异常"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        logger.warning(f"[JSON 损坏] {path.name}: {e}; 备份为 .broken 后跳过")
+        # 备份损坏文件，避免下次写入覆盖丢失
+        try:
+            broken_path = path.with_suffix(f".json.broken.{int(time.time())}")
+            path.rename(broken_path)
+            logger.warning(f"[JSON 损坏] 已备份至 {broken_path.name}")
+        except Exception as rename_err:
+            logger.warning(f"[JSON 损坏] 备份失败: {rename_err}")
+        return None
+    except Exception as e:
+        logger.warning(f"[JSON 损坏] {path.name}: {e}")
+        return None
+
+
 def _acquire_file_lock(lock_path: Path, timeout: int = FILE_LOCK_TIMEOUT) -> bool:
     start = time.time()
     while True:
@@ -479,9 +545,26 @@ def _existing_dates(code: str) -> Set[str]:
 
 
 def _save(code: str, records: Dict[str, dict]) -> int:
-    """合并写入，新增条数"""
+    """合并写入，新增条数
+
+    流程：
+      1. 数据校验：每条 record 经 _sanitize_record 过滤异常值
+      2. 安全加载：JSON 损坏时备份为 .broken.*，不抛异常
+      3. 增量写入：仅追加不存在的 report_date
+      4. UTF-8 写入：ensure_ascii=False，特殊字符不破坏 JSON
+    """
     if not records:
         return 0
+
+    # 数据校验（防止异常值写入）
+    sanitized: Dict[str, dict] = {}
+    for rp, rec in records.items():
+        clean = _sanitize_record(code, rec)
+        if clean:
+            sanitized[rp] = clean
+    if not sanitized:
+        return 0
+
     fpath = FISCAL_DIR / f"{code}.json"
     lock_path = LOCK_DIR / f"{code}.lock"
     if not _acquire_file_lock(lock_path):
@@ -489,7 +572,15 @@ def _save(code: str, records: Dict[str, dict]) -> int:
         return 0
     try:
         if fpath.exists():
-            fd = json.loads(fpath.read_text(encoding="utf-8"))
+            fd = _safe_json_load(fpath)
+            if fd is None:
+                # JSON 损坏已被备份为 .broken.*，从空文件重建
+                fd = {
+                    "code": code,
+                    "name": _load_name(code),
+                    "update_date": "",
+                    "fiscal": [],
+                }
         else:
             fd = {
                 "code": code,
@@ -500,13 +591,15 @@ def _save(code: str, records: Dict[str, dict]) -> int:
 
         exist = {q["report_date"] for q in fd.get("fiscal", [])}
         added = 0
-        for rp, rec in records.items():
+        for rp, rec in sanitized.items():
             if rp not in exist:
                 fd["fiscal"].append(rec)
                 added += 1
 
         if added:
             fd["update_date"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # 关键：ensure_ascii=False 避免中文名/单位字符串被 ASCII 转义；
+            # default=str 让 numpy/non-serializable 类型降级为 str 而非崩溃
             fpath.write_text(
                 json.dumps(fd, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
@@ -604,20 +697,34 @@ def _process_one(code: str, targets: List[Tuple[int, int]]) -> int:
       2. 备源拉一轮（只补主源缺失的字段，不覆盖已有）
       3. 写入磁盘
 
-    注意：akshare_first 模式下默认跳过 baostock 兜底（实测 baostock 高并发
-    下被限流，5000+ 股票场景 80% 请求失败 + 重试拖慢整体速度）。
-    如需 baostock 兜底，设置环境变量 FISCAL_DUAL_SOURCE=1
+    注意：akshare_first 默认不调用 baostock（避免 baostock 高并发限流
+    拖慢整体速度），但若 akshare 缺关键字段（营业总收入/总股本/归母净利润）
+    会**自动**启用 baostock 兜底补缺。
+
+    设置环境变量 FISCAL_DUAL_SOURCE=always 强制每只股票都双源。
     """
     target_dates = {_fmt_date(y, q) for y, q in targets}
-    use_dual = os.environ.get("FISCAL_DUAL_SOURCE", "0") == "1"
+    force_dual = os.environ.get("FISCAL_DUAL_SOURCE", "").lower() == "always"
+    # 关键字段（缺失时自动启用 baostock 兜底）
+    KEY_FIELDS = ("营业总收入", "归母净利润", "总股本")
+
+    def _needs_fallback(recs: Dict[str, dict]) -> bool:
+        """检查 records 是否缺失关键字段"""
+        for rp in target_dates:
+            rec = recs.get(rp)
+            if not rec:
+                continue
+            if any(rec.get(k) is None for k in KEY_FIELDS):
+                return True
+        return False
 
     if PRIMARY_SOURCE == "akshare_first":
         primary_records = fetch_from_akshare(code, targets)
         primary_records = {rp: r for rp, r in primary_records.items() if rp in target_dates}
         records = primary_records
 
-        if use_dual:
-            # 仅在显式启用时调用 baostock 兜底
+        # 自动兜底：缺关键字段 或 强制双源
+        if force_dual or _needs_fallback(primary_records):
             try:
                 bs_records = fetch_from_baostock(code, targets)
                 bs_records = {rp: r for rp, r in bs_records.items() if rp in target_dates}
@@ -628,6 +735,7 @@ def _process_one(code: str, targets: List[Tuple[int, int]]) -> int:
                             existing_rec[k] = v
                     records.setdefault(rp, existing_rec)
                     records[rp] = existing_rec
+                logger.debug(f"{code} baostock 兜底补字段")
             except Exception as e:
                 logger.debug(f"baostock 兜底 {code} 失败: {e}")
     else:

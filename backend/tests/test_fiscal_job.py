@@ -110,8 +110,8 @@ def _mock_baostock_records(code, targets):
 
 
 class TestProcessOne:
-    def test_baostock_only_writes_new_records(self, temp_dirs):
-        """baostock 返回的数据应被写入；已存在的 report_date 不重复"""
+    def test_akshare_first_writes_new_records(self, temp_dirs):
+        """akshare 主源：新数据写入，已存在的 report_date 不重复"""
         fiscal_dir, _ = temp_dirs
 
         # 预置一条已有记录（2025Q4）
@@ -132,9 +132,9 @@ class TestProcessOne:
 
         targets = [(2026, 1), (2025, 4)]
         with patch.object(
-            fiscal_job, "fetch_from_baostock",
+            fiscal_job, "fetch_from_akshare",
             side_effect=lambda c, t: _mock_baostock_records(c, t),
-        ), patch.object(fiscal_job, "fetch_from_akshare", return_value={}):
+        ), patch.object(fiscal_job, "fetch_from_baostock", return_value={}):
             added = fiscal_job._process_one("000001", targets)
 
         # 2025Q4 已存在（不应再加），2026Q1 应新增
@@ -147,6 +147,76 @@ class TestProcessOne:
         # 已有记录未被覆盖
         original = next(q for q in saved["fiscal"] if q["report_date"] == "2025-12-31")
         assert original["营业总收入"] == 999.0
+
+    def test_baostock_autofallback_when_akshare_missing_key_fields(self, temp_dirs):
+        """akshare 缺关键字段时自动启用 baostock 兜底（修复前是手写环境变量）"""
+        fiscal_dir, _ = temp_dirs
+        targets = [(2026, 2)]
+
+        # akshare 只返回净资产，缺营收/总股本
+        akshare_partial = {
+            "2026-06-30": {
+                "report_date": "2026-06-30",
+                "year": 2026,
+                "period": "06-30",
+                "每股净资产": 5.69,
+                "资产负债率": 27.49,
+            }
+        }
+        # baostock 提供完整数据
+        baostock_full = {
+            "2026-06-30": {
+                "report_date": "2026-06-30",
+                "year": 2026,
+                "period": "06-30",
+                "营业总收入": 2.3e8,
+                "归母净利润": -1.4e7,
+                "总股本": 2.4e8,
+            }
+        }
+        with patch.object(
+            fiscal_job, "fetch_from_akshare", return_value=akshare_partial
+        ), patch.object(
+            fiscal_job, "fetch_from_baostock", return_value=baostock_full
+        ):
+            added = fiscal_job._process_one("000014", targets)
+
+        assert added == 1
+        saved = json.loads((fiscal_dir / "000014.json").read_text(encoding="utf-8"))
+        rec = saved["fiscal"][0]
+        # 关键字段由 baostock 兜底补齐
+        assert rec["营业总收入"] == 2.3e8
+        assert rec["归母净利润"] == -1.4e7
+        assert rec["总股本"] == 2.4e8
+        # akshare 提供的字段也保留
+        assert rec["每股净资产"] == 5.69
+
+    def test_baostock_not_called_when_akshare_complete(self, temp_dirs):
+        """akshare 数据完整时不调用 baostock（避免限流拖慢速度）"""
+        fiscal_dir, _ = temp_dirs
+        targets = [(2026, 2)]
+
+        akshare_complete = {
+            "2026-06-30": {
+                "report_date": "2026-06-30",
+                "year": 2026,
+                "period": "06-30",
+                "营业总收入": 2.3e8,
+                "归母净利润": -1.4e7,
+                "每股净资产": 5.69,
+                "资产负债率": 27.49,
+                "总股本": 2.4e8,
+            }
+        }
+        with patch.object(
+            fiscal_job, "fetch_from_akshare", return_value=akshare_complete
+        ) as aks_mock, patch.object(
+            fiscal_job, "fetch_from_baostock"
+        ) as bs_mock:
+            added = fiscal_job._process_one("000014", targets)
+
+        assert added == 1
+        bs_mock.assert_not_called()  # 不应调用 baostock
 
     def test_akshare_fills_baostock_gap(self, temp_dirs):
         """baostock 缺的季度，akshare 应兜底"""
@@ -205,3 +275,196 @@ class TestFileLock:
         lock_path.unlink()
         # 第二次应能再获取
         assert fiscal_job._acquire_file_lock(lock_path, timeout=2)
+
+
+# ============================================================
+# 数据校验测试（防止异常值写入）
+# ============================================================
+
+class TestSanitizeRecord:
+    """_sanitize_record 应丢弃超出合理范围的数值字段"""
+
+    def test_normal_values_kept(self):
+        rec = {
+            "营业总收入": 7e9,        # 70 亿，平安银行 H1 营收，合理
+            "归母净利润": 2.5e9,     # 25 亿
+            "每股净资产": 24.13,     # 茅台/平安水平
+            "总股本": 1.94e10,       # 194 亿股
+            "资产负债率": 90.91,
+        }
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert cleaned == rec
+
+    def test_revenue_100x_too_large_dropped(self):
+        """回归 baostock MBRevenue 误乘 1e6 历史 bug"""
+        rec = {
+            "营业总收入": 7e15,       # 7000 万亿（错误值，原 bug 现象）
+            "归母净利润": 2.5e9,
+        }
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        # 营收字段应被丢弃，归母净利保留
+        assert "营业总收入" not in cleaned
+        assert cleaned["归母净利润"] == 2.5e9
+
+    def test_total_share_out_of_range_dropped(self):
+        rec = {
+            "总股本": 1e15,           # 1000 万亿股（异常）
+            "营业总收入": 1e9,
+        }
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert "总股本" not in cleaned
+        assert cleaned["营业总收入"] == 1e9
+
+    def test_negative_total_share_dropped(self):
+        rec = {"总股本": -1e8}
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert "总股本" not in cleaned
+
+    def test_naps_out_of_range_dropped(self):
+        rec = {"每股净资产": 5000.0}  # 每股净资产超过 1000 元的几乎不存在
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert "每股净资产" not in cleaned
+
+    def test_debt_ratio_out_of_range_dropped(self):
+        rec = {"资产负债率": 150.0}   # 超过 100% 异常
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert "资产负债率" not in cleaned
+
+    def test_non_numeric_value_kept(self):
+        """非数值字段（如字符串）跳过校验"""
+        rec = {"report_date": "2026-06-30", "year": 2026}
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert cleaned == rec
+
+    def test_none_value_kept(self):
+        rec = {"营业总收入": None}
+        cleaned = fiscal_job._sanitize_record("000001", rec)
+        assert cleaned["营业总收入"] is None
+
+
+# ============================================================
+# _safe_json_load 测试
+# ============================================================
+
+class TestSafeJsonLoad:
+    def test_valid_json_loads(self, temp_dirs):
+        fiscal_dir, _ = temp_dirs
+        fp = fiscal_dir / "valid.json"
+        fp.write_text(json.dumps({"code": "000001", "name": "test"}), encoding="utf-8")
+        result = fiscal_job._safe_json_load(fp)
+        assert result == {"code": "000001", "name": "test"}
+
+    def test_corrupted_json_backed_up_and_returns_none(self, temp_dirs):
+        """JSON 损坏时备份原文件并返回 None，不抛异常"""
+        fiscal_dir, _ = temp_dirs
+        fp = fiscal_dir / "broken.json"
+        # 模拟缺失双引号的损坏 JSON（000736 历史问题）
+        fp.write_text(
+            '{\n  "code": "000736",\n  "name": 中交地产,\n  "fiscal": []\n}',
+            encoding="utf-8",
+        )
+        result = fiscal_job._safe_json_load(fp)
+        assert result is None
+        # 原文件应被备份
+        broken_files = list(fiscal_dir.glob("broken.json.broken.*"))
+        assert len(broken_files) == 1
+        # 备份文件存在，原文件应已被移动
+        assert not fp.exists()
+
+    def test_missing_file_returns_none(self, temp_dirs):
+        fiscal_dir, _ = temp_dirs
+        fp = fiscal_dir / "nonexistent.json"
+        result = fiscal_job._safe_json_load(fp)
+        assert result is None
+
+
+# ============================================================
+# 集成测试：_save 集成数据校验
+# ============================================================
+
+class TestSaveIntegration:
+    def test_save_filters_outlier_revenue(self, temp_dirs):
+        """_save 应拒绝异常营收的写入"""
+        fiscal_dir, hist_dir = temp_dirs
+        # mock FISCAL_DIR
+        fiscal_job.FISCAL_DIR = fiscal_dir
+        fiscal_job.LOCK_DIR = fiscal_dir / ".locks"
+        fiscal_job.LOCK_DIR.mkdir(exist_ok=True)
+
+        records = {
+            "2026-06-30": {
+                "report_date": "2026-06-30",
+                "year": 2026,
+                "period": "06-30",
+                "营业总收入": 7e15,   # 异常值
+                "归母净利润": -1.4e7, # 正常
+            },
+        }
+        added = fiscal_job._save("000014", records)
+        assert added == 1  # 添加了，但异常字段被丢弃
+        saved = json.loads((fiscal_dir / "000014.json").read_text(encoding="utf-8"))
+        record = saved["fiscal"][0]
+        assert "营业总收入" not in record
+        assert record["归母净利润"] == -1.4e7
+
+    def test_save_normalizes_chinese_names(self, temp_dirs):
+        """中文名应正确写入而非被 ASCII 转义（防 000736 类损坏）"""
+        fiscal_dir, _ = temp_dirs
+        fiscal_job.FISCAL_DIR = fiscal_dir
+        fiscal_job.LOCK_DIR = fiscal_dir / ".locks"
+        fiscal_job.LOCK_DIR.mkdir(exist_ok=True)
+
+        records = {
+            "2026-06-30": {
+                "report_date": "2026-06-30",
+                "year": 2026,
+                "period": "06-30",
+                "营业总收入": 2.3e8,
+                "归母净利润": -1.4e7,
+            },
+        }
+        fiscal_job._save("000014", records)
+        # 文件应可正常解析
+        data = json.loads((fiscal_dir / "000014.json").read_text(encoding="utf-8"))
+        assert data["code"] == "000014"
+        # 文件内容应是合法的 JSON（中文不会被 ASCII 转义）
+        content = (fiscal_dir / "000014.json").read_text(encoding="utf-8")
+        assert json.loads(content)  # 二次解析不抛异常
+        # 第一条记录正常
+        assert data["fiscal"][0]["营业总收入"] == 2.3e8
+
+
+# ============================================================
+# _parse_bs_records 单位测试
+# ============================================================
+
+class TestParseBsRecordsUnits:
+    """回归测试：baostock 字段已是'元'单位，不应再乘 1e6"""
+
+    def test_revenue_kept_as_yuan(self):
+        """MBRevenue 直接保留，不乘 1e6"""
+        baostock_profit = {
+            "2026-06-30": {
+                "statDate": "2026-06-30",
+                "netProfit": "25696000000.00",     # 256.96 亿
+                "MBRevenue": "70617000000.00",      # 706.17 亿（平安银行 H1 营收）
+                "totalShare": "19405918198",
+                "liqaShare": "19405684991",
+            }
+        }
+        baostock_balance = {"2026-06-30": {"liabilityToAsset": "0.909067"}}
+        baostock_dupont: Dict = {"2026-06-30": {}}
+        tbl_rows = {
+            (2026, 2): {
+                "profit": baostock_profit,
+                "balance": baostock_balance,
+                "dupont": baostock_dupont,
+            }
+        }
+        rec = fiscal_job._parse_bs_records(tbl_rows, 2026, 2)
+        # 关键修复：营业总收入 = 70617000000.0（706.17 亿），不应是 7.06e16
+        assert rec["营业总收入"] == 70617000000.0, (
+            f"baostock MBRevenue 已是元单位，不应乘 1e6；得到 {rec['营业总收入']}"
+        )
+        assert rec["归母净利润"] == 25696000000.0
+        assert rec["总股本"] == 19405918198.0
