@@ -214,7 +214,11 @@ def _parse_bs_records(
     liqa_share = _f(prows.get("liqaShare"))
     debt_ratio = _f(bdata.get("liabilityToAsset"))
 
-    total_rev = round(mb_revenue * 1e6, 4) if mb_revenue else None
+    # 修复: baostock 的 MBRevenue / netProfit / totalShare / liqaShare 字段
+    # 单位均为"元"（已验证 000001 平安银行 MBRevenue=70617000000=706.17 亿），
+    # 早期 _parse_bs_records 误乘 1e6 导致 188 只股票半年报营收被放大 100 万倍。
+    # 不要乘以 1e6，直接使用原值。
+    total_rev = mb_revenue
 
     naps = None
     if net_profit and total_share:
