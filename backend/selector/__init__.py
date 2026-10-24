@@ -93,8 +93,13 @@ class StockSelector:
     def calculate_technical_indicators(self, hist_data: StockDataList) -> Indicators:
         return calculate_technical_indicators(hist_data)
 
-    def calculate_advanced_indicators(self, hist_data: StockDataList) -> Indicators:
-        return calculate_advanced_indicators(hist_data)
+    def calculate_advanced_indicators(
+        self,
+        hist_data: StockDataList,
+        float_shares: Optional[float] = None,
+        code: Optional[str] = None,
+    ) -> Indicators:
+        return calculate_advanced_indicators(hist_data, float_shares, code)
 
     def calculate_rsrs(self, hist_data: StockDataList, period: int = 18) -> Dict[str, Any]:
         return calculate_rsrs(hist_data, period)

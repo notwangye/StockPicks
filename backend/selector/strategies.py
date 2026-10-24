@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from ._types import HistData, Indicators, MarketThresholds, StockDataList, StockPick
 from .indicators import calculate_advanced_indicators, calculate_rsrs
@@ -149,7 +151,9 @@ def select_mid_long_term_stocks(
             if not hist_data or len(hist_data) < 120:
                 return None
 
-            indicators: Indicators = calculate_advanced_indicators(hist_data)
+            indicators: Indicators = calculate_advanced_indicators(
+                hist_data, None, code
+            )
             if not indicators:
                 return None
 
@@ -215,7 +219,11 @@ def select_mid_long_term_stocks(
         f"5日涨幅{_filter_stats['ch5_fail']}, 评分{_filter_stats['score_fail']})"
     )
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # 【审查修复】补上"代码"作为末位次级键：候选来自 as_completed()，
+    # 同分股票的原始顺序取决于线程完成顺序，不加兜底键则结果不可复现。
+    results.sort(
+        key=lambda x: (-_to_int(x.get("score", 0), 0), str(x.get("code", "")))
+    )
 
     # 第五阶段：基本面筛选
     logger.info("开始基本面筛选...")
@@ -232,18 +240,24 @@ def select_mid_long_term_stocks(
     for r in results:
         fin_filter_stats["total"] += 1
         fin_code: str = r.get("code", "")
+        fin_name: str = r.get("name", "")
 
         fin_result: Dict[str, Any] = fiscal_fetcher.check_financial(
             fin_code, stock_type="mid_long"
         )
 
+        # 【审查修复】ST 判定取"财务快照 + 最新名称"的并集，
+        # 避免财务数据滞后期间新被 ST 的股票混进中长线候选（详见 _is_st_name）。
+        if _is_st_result(fin_result, fin_name):
+            fin_filter_stats["st_fail"] += 1
+            logger.info(f"基本面淘汰: {fin_code} - ST股票")
+            continue
+
         if not fin_result["pass"]:
             reason: str = (
                 fin_result["reasons"][0] if fin_result["reasons"] else "未知原因"
             )
-            if "ST" in reason:
-                fin_filter_stats["st_fail"] += 1
-            elif "ROE" in reason:
+            if "ROE" in reason:
                 fin_filter_stats["roe_fail"] += 1
             elif "净利润" in reason:
                 fin_filter_stats["profit_fail"] += 1
@@ -265,8 +279,19 @@ def select_mid_long_term_stocks(
         f"净利润{fin_filter_stats['profit_fail']}, 评分{fin_filter_stats['score_fail']})"
     )
 
+    # 中长线：以财务分为优先（价值投资特性），但财务数据缺失（financial_score=0）
+    # 的股票应回退到按技术分排序，避免错杀有技术形态但暂缺财务数据的标的
+    # 【审查修复】末位补"代码"兜底键，保证排序结果唯一可复现（同分不再依赖线程顺序）
     financial_filtered.sort(
-        key=lambda x: (x.get("financial_score", 0), x.get("score", 0)), reverse=True
+        key=lambda x: (
+            -(
+                _to_int(x.get("financial_score", 0), 0)
+                if _to_int(x.get("financial_score", 0), 0) > 0
+                else -1
+            ),
+            -_to_int(x.get("score", 0), 0),
+            str(x.get("code", "")),
+        ),
     )
 
     # 第六阶段：行业分散约束
@@ -293,10 +318,102 @@ def select_mid_long_term_stocks(
     return selected
 
 
+def _to_int(value: Any, default: int = 0) -> int:
+    """安全转 int（脏数据/None/字符串都回落到默认值）"""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ST / 退市风险股名称特征（与 fiscal.check_financial 里的规则保持一致）
+_ST_NAME_PATTERN = re.compile(r"(ST|S\*ST|\*ST|退市?|暂停上市)")
+
+
+def _is_st_name(name: Any) -> bool:
+    """按股票名称判断是否为 ST / 退市风险股
+
+    【审查修复】ST 判定此前只依赖财务文件里的 name，而财务数据是每周/每月
+    快照（实测当前快照落后 7 周）。这段时间内新被 ST 的股票（如 000078
+    海王生物 -> ST海王）不会被识别，而超短线选股里 ST 是唯一的硬性风险
+    闸门 —— 漏判就会把 ±5% 限幅的高风险票放进交易候选。
+
+    现在改为"两个来源取并集"：
+      - 财务文件的 name（快照，可能滞后，但能反映已摘帽的股票）
+      - 股票列表的 name（每日更新的 K 线文件，反映最新状态）
+    实测两者对 23 只股票的判定不一致（9 只新增 ST、14 只已摘帽），
+    取并集后排除数从 242 增至 251（+0.16%），代价可忽略，
+    换来的是"不会漏掉近期被 ST 的股票"。
+    """
+    if not name:
+        return False
+    return bool(_ST_NAME_PATTERN.search(str(name)))
+
+
+def _is_st_result(fin_result: Dict[str, Any], fresh_name: Any) -> bool:
+    """综合财务检查结果与最新名称，判断是否属于 ST 风险股"""
+    if _is_st_name(fresh_name):
+        return True
+    details: Any = fin_result.get("details")
+    if isinstance(details, dict) and details.get("is_st"):
+        return True
+    if not fin_result.get("pass", False):
+        reasons: Any = fin_result.get("reasons") or []
+        if isinstance(reasons, (list, tuple)):
+            for reason in reasons:
+                if "ST" in str(reason):
+                    return True
+    return False
+
+
+def _short_term_sort_key(item: StockPick) -> Tuple[int, float, int, str]:
+    """超短线选股排序键（确定性）
+
+    【审查修复】原先只按 score 排序，而候选来自 ThreadPoolExecutor 的
+    as_completed() —— 同分股票的先后取决于**线程完成顺序**，导致同一份数据
+    每次跑出来的选股结果可能不同（可复现性问题）。
+
+    这里补充确定性的次级键：技术分 → 换手异动倍数 → 连板数 → 股票代码。
+    全部是技术/资金面指标，**不引入任何财务因子**，保持"超短线不看重财务"
+    的设计意图；最后用代码做兜底，保证排序结果唯一且稳定。
+    """
+    indicators: Dict[str, Any] = {}
+    details: Any = item.get("details")
+    if isinstance(details, dict):
+        raw_indicators: Any = details.get("indicators")
+        if isinstance(raw_indicators, dict):
+            indicators = raw_indicators
+
+    turnover_ratio: float = 0.0
+    try:
+        turnover_ratio = float(indicators.get("turnover_ratio_5d", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        turnover_ratio = 0.0
+    if not math.isfinite(turnover_ratio):
+        turnover_ratio = 0.0
+
+    consecutive: int = _to_int(indicators.get("consecutive_limit_up", 0), 0)
+    score: int = _to_int(item.get("score", 0), 0)
+
+    return (-score, -turnover_ratio, -consecutive, str(item.get("code", "")))
+
+
 def _evaluate_short_term_candidate(
-    fetcher: Fetcher, stock: StockPick, strategy: StrategyType
+    fetcher: Fetcher,
+    stock: StockPick,
+    strategy: StrategyType,
+    fiscal_fetcher: Optional[FiscalFetcher] = None,
 ) -> Optional[StockPick]:
-    """评估单只超短线股票（用于并行计算）"""
+    """评估单只超短线股票（用于并行计算）
+
+    Args:
+        fetcher: DataFetcher 实例
+        stock: 股票基本信息
+        strategy: 'aggressive' / 'conservative'
+        fiscal_fetcher: 仅用于取真实流通股本以计算换手率（不参与评分）
+    """
     try:
         code: str = stock.get("代码", "")
         if not code or len(code) != 6:
@@ -310,12 +427,25 @@ def _evaluate_short_term_candidate(
         if not hist_data or len(hist_data) < min_days:
             return None
 
+        # 【修复】本地 K 线没有 turnover 字段，不传真实股本的话换手率会被
+        # 高估 2 倍以上（98% 的股票），且"资金异动"维度恒为 0 分。
+        float_shares: Optional[float] = None
+        if fiscal_fetcher is not None:
+            try:
+                float_shares = fiscal_fetcher.get_float_shares(code)
+            except Exception:
+                float_shares = None
+
         if strategy == "aggressive":
             score: int
             details: Dict[str, Any]
-            score, details = calculate_short_term_aggressive(hist_data, stock)
+            score, details = calculate_short_term_aggressive(
+                hist_data, stock, float_shares
+            )
         else:
-            score, details = calculate_short_term_conservative(hist_data, stock)
+            score, details = calculate_short_term_conservative(
+                hist_data, stock, float_shares
+            )
 
         if score > 0:
             return {
@@ -346,7 +476,7 @@ def select_short_term_stocks(
         strategy: 'aggressive' 激进型 / 'conservative' 稳健型
 
     Returns:
-        选股结果列表，按 (financial_score, score) 降序
+        选股结果列表，按技术分降序（财务仅用于剔除 ST 风险）
     """
     logger.info(f"开始筛选超短线股票({strategy})...")
     all_stocks: List[StockPick] = fetcher.get_stocks_from_historical()
@@ -356,7 +486,9 @@ def select_short_term_stocks(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_evaluate_short_term_candidate, fetcher, s, strategy): s
+            executor.submit(
+                _evaluate_short_term_candidate, fetcher, s, strategy, fiscal_fetcher
+            ): s
             for s in all_stocks
         }
         for future in as_completed(futures):
@@ -364,31 +496,48 @@ def select_short_term_stocks(
             if result:
                 candidates.append(result)
 
-    logger.info(f"技术面候选 {len(candidates)} 只，开始基本面筛选...")
+    logger.info(f"技术面候选 {len(candidates)} 只，开始基本面筛查...")
     financial_filtered: List[StockPick] = []
     fin_filter_stats: Dict[str, int] = {
         "total": 0,
         "st_fail": 0,
-        "roe_fail": 0,
+        "fin_weak": 0,
         "pass": 0,
     }
 
     for r in candidates:
         fin_filter_stats["total"] += 1
         _code: str = r.get("code", "")
+        _name: str = r.get("name", "")
 
         fin_result: Dict[str, Any] = fiscal_fetcher.check_financial(
             _code, stock_type="short_term"
         )
 
+        # 超短线只做风险排除，不做基本面筛选：
+        # 激进型/稳健型抓的是"资金异动 + 技术形态"，ST 属于交易风险必须挡掉；
+        # 其余情况（财务评分低、ROE 一般、净利润下滑、甚至无财务数据）
+        # 都不该淘汰——短线赚的是波动而非价值，财务差但资金疯狂的票正是目标。
+        #
+        # 【审查修复】ST 判定改为"财务快照 + 最新名称"取并集，
+        # 避免财务数据滞后期间新被 ST 的股票混进超短线候选（详见 _is_st_name）。
+        if _is_st_result(fin_result, _name):
+            fin_filter_stats["st_fail"] += 1
+            logger.info(f"风险排除: {_code} - ST股票")
+            continue
+
         if not fin_result["pass"]:
             reason: str = fin_result["reasons"][0] if fin_result["reasons"] else "未知"
-            if "ST" in reason:
-                fin_filter_stats["st_fail"] += 1
-            elif "ROE" in reason:
-                fin_filter_stats["roe_fail"] += 1
-            logger.info(f"基本面淘汰: {_code} - {reason}")
-            continue
+            # 非 ST 的基本面问题：仅记录，不淘汰
+            fin_filter_stats["fin_weak"] = (
+                fin_filter_stats.get("fin_weak", 0) + 1
+            )
+            logger.debug(f"基本面偏弱但保留(短线不淘汰): {_code} - {reason}")
+            # 非 ST 的基本面问题：仅记录，不淘汰
+            fin_filter_stats["fin_weak"] = (
+                fin_filter_stats.get("fin_weak", 0) + 1
+            )
+            logger.debug(f"基本面偏弱但保留(短线不淘汰): {_code} - {reason}")
 
         fin_filter_stats["pass"] += 1
         r["financial_score"] = fin_result["score"]
@@ -397,13 +546,18 @@ def select_short_term_stocks(
         financial_filtered.append(r)
 
     logger.info(
-        f"基本面筛选: 参与{fin_filter_stats['total']}只, 通过{fin_filter_stats['pass']}只 "
-        f"(ST{fin_filter_stats['st_fail']}, ROE{fin_filter_stats['roe_fail']})"
+        f"基本面筛查: 参与{fin_filter_stats['total']}只, 保留{fin_filter_stats['pass']}只 "
+        f"(ST排除{fin_filter_stats['st_fail']}, 财务偏弱保留{fin_filter_stats.get('fin_weak', 0)})"
     )
 
-    financial_filtered.sort(
-        key=lambda x: (x.get("financial_score", 0), x.get("score", 0)), reverse=True
-    )
+    # 超短线排序：纯技术分 + 确定性次级键。
+    # 【修复】原来把 financial_score 作为第二排序键，导致技术分相同的股票
+    # 会因财务好坏被重新排序——短线是波动交易，不该由财务决定名次。
+    # 【审查修复】进一步改为 _short_term_sort_key：去掉财务权重后，
+    # 同分股票会退化成"按线程完成顺序"排列，结果不可复现；
+    # 现补上换手异动/连板/代码三个确定性次级键（均为技术面，不含财务）。
+    # ST 已在上方硬排除，这里无需再考虑。
+    financial_filtered.sort(key=_short_term_sort_key)
     selected: List[StockPick] = financial_filtered[:limit]
 
     logger.info(f"筛选出 {len(selected)} 只超短线股票({strategy})")
@@ -510,9 +664,13 @@ def select_with_rsrs_kdj_cci(
         f"(ST{fin_filter_stats['st_fail']}, ROE{fin_filter_stats['roe_fail']})"
     )
 
+    # 【审查修复】末位补"代码"兜底键，保证同分时结果可复现
     financial_filtered.sort(
-        key=lambda x: (x.get("buy_score", 0), x.get("financial_score", 0)),
-        reverse=True,
+        key=lambda x: (
+            -_to_int(x.get("buy_score", 0), 0),
+            -_to_int(x.get("financial_score", 0), 0),
+            str(x.get("code", "")),
+        ),
     )
     selected: List[Dict[str, Any]] = financial_filtered[:limit]
 

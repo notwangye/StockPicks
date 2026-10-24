@@ -9,13 +9,109 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 财务记录解析辅助函数
+#
+# 历史数据里 period 字段格式不统一：最新季度写成 '06-30'（带横杠），
+# 历史季度写成 '0630'（不带横杠）。直接用 period 做字符串匹配会漏掉
+# 几乎所有股票，因此统一改为"季度月份 + 年份"解析。
+# ============================================================
+
+# 季度月份 -> 年化系数（归母净利润为年初至今累计值，需年化才是全年 ROE）
+_ANNUALIZE_FACTOR: Dict[int, float] = {3: 4.0, 6: 2.0, 9: 4.0 / 3.0, 12: 1.0}
+
+# report_date 解析：兼容 "2026-06-30" / "2026-6-30" / "20260630" / "2026年6月30日"
+# 【审查修复】原实现用固定下标 rd[5:7] 取月份，遇到不补零的 "2026-6-30" 会取到
+# "6-" 而解析失败（月份退化为 None → 年化系数丢失 → ROE 量级差 2~4 倍）。
+_REPORT_DATE_RE = re.compile(r"^\s*(\d{4})\s*[-/.年]?\s*(\d{1,2})")
+
+
+def _parse_report_date(report_date: Any) -> Tuple[Optional[int], Optional[int]]:
+    """解析 report_date，返回 (年, 月)；解析不出来返回 (None, None)"""
+    rd: str = str(report_date or "")
+    matched = _REPORT_DATE_RE.match(rd)
+    if not matched:
+        return (None, None)
+    return (int(matched.group(1)), int(matched.group(2)))
+
+
+def _quarter_month(rec: Dict[str, Any]) -> Optional[int]:
+    """从财务记录中解析季度月份（3/6/9/12），兼容 report_date / period 各种写法"""
+    rd: str = str(rec.get("report_date", "") or "")
+    _year, rd_month = _parse_report_date(rd)
+    if rd_month is not None and rd_month in _ANNUALIZE_FACTOR:
+        return rd_month
+
+    period: str = str(rec.get("period", "") or "")
+    digits: str = "".join(ch for ch in period if ch.isdigit())
+    if len(digits) >= 2:
+        mm: int = int(digits[:2])
+        if mm in _ANNUALIZE_FACTOR:
+            return mm
+
+    if period.upper().startswith("Q"):
+        try:
+            q: int = int(period[1])
+            if 1 <= q <= 4:
+                return q * 3
+        except ValueError:
+            pass
+    return None
+
+
+def _quarter_year(rec: Dict[str, Any]) -> Optional[int]:
+    """从财务记录中解析年份"""
+    y: Any = rec.get("year")
+    if isinstance(y, int):
+        return y
+    if isinstance(y, str) and y.isdigit():
+        return int(y)
+
+    rd: str = str(rec.get("report_date", "") or "")
+    rd_year, _month = _parse_report_date(rd)
+    if rd_year is not None:
+        return rd_year
+    return None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """把脏数据（None / '' / 'None' / 非数字 / NaN / Inf）安全转成 float
+
+    【审查修复】原实现会接受 'nan' / 'inf' 并原样返回：
+    NaN 参与任何大小比较都是 False，会让该股"看起来有数据但全部判定失败"，
+    且写进 JSON 会产生非标准 JSON。这里统一把非有限值判为脏数据。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped: str = value.strip()
+        if not stripped or stripped.lower() in (
+            "none",
+            "nan",
+            "inf",
+            "-inf",
+            "+inf",
+            "infinity",
+            "-infinity",
+        ):
+            return None
+    try:
+        result: float = float(value)
+    except (ValueError, TypeError):
+        return None
+    if math.isnan(result) or math.isinf(result):
+        return None
+    return result
 
 
 def get_fiscal_data_dir() -> Path:
@@ -63,6 +159,7 @@ class FiscalDataFetcher:
         )
         self._cache: Dict[str, Dict[str, Any]] = {}  # 缓存财务数据
         self._cache_time: Dict[str, datetime] = {}
+        self._shares_cache: Dict[str, Optional[float]] = {}  # 缓存流通股本
         self.cache_validity: int = 3600 * 6  # 6小时缓存
 
     def _is_cache_valid(self, symbol: str) -> bool:
@@ -114,72 +211,88 @@ class FiscalDataFetcher:
                 key=lambda x: x.get("report_date", ""),
                 reverse=True,
             )
-            recent: List[Dict[str, Any]] = fiscal_list[:4]  # 取最近4个季度
+            # 【修复】原来只取最近4个季度，而"去年同期"最早出现在第5位，
+            # 导致同比增长率永远算不出来。放宽到8个季度以覆盖去年同期。
+            recent: List[Dict[str, Any]] = fiscal_list[:8]
 
             def get_q(qidx: int, field: str, default: Optional[float] = None) -> Optional[float]:
                 """取指定季度字段值（自动转 float，处理 'None'/'' 等脏数据）"""
-                if qidx < len(recent):
-                    v: Any = recent[qidx].get(field, default)
-                    if v is None or v == "" or v == "None":
-                        return default
-                    try:
-                        return float(v)
-                    except (ValueError, TypeError):
-                        return default
+                if 0 <= qidx < len(recent):
+                    return _as_float(recent[qidx].get(field))
                 return default
 
             # 计算 ROE = 归母净利润 / 净资产总计
             bps: Optional[float] = get_q(0, "每股净资产")
             total_share: Optional[float] = get_q(0, "总股本")
+
+            # 【修复】约31%的股票最新季度缺"总股本"字段，但更早的季度通常有。
+            # 回溯查找最近一个可用值，避免 ROE 直接算不出来（丢掉15分）。
+            if total_share is None:
+                for q in recent[1:]:
+                    total_share = _as_float(q.get("总股本"))
+                    if total_share is not None:
+                        break
+
             net_assets: Optional[float] = (
                 bps * total_share if bps and total_share else None
             )
             net_profit: Optional[float] = get_q(0, "归母净利润")
             roe: Optional[float] = (
                 (net_profit / net_assets * 100)
-                if (net_profit and net_assets and net_assets > 0)
+                if (net_profit is not None and net_assets and net_assets > 0)
                 else None
             )
+
+            # 【修复】归母净利润是"年初至今累计值"（半年报=上半年累计），
+            # 而 ROE 的评分阈值（20%/15%/10%）是年度口径。
+            # 不年化会导致量级差 2~4 倍，中位 ROE 仅 2.45%，几乎没人能拿到 ROE 分。
+            roe_annualized: Optional[float] = None
+            q0_month: Optional[int] = _quarter_month(recent[0])
+            if roe is not None and q0_month is not None:
+                roe_annualized = roe * _ANNUALIZE_FACTOR[q0_month]
 
             # 资产负债率
             debt_ratio: Optional[float] = get_q(0, "资产负债率")
 
-            # ST 状态
-            stock_name: str = content.get("name", "")
-            st_pattern = re.compile(r"(ST|S\*ST|\*ST|退市?|暂停上市)", re.IGNORECASE)
+            # ST 状态（【修复】name 可能为 None，直接 re.search(None) 会抛异常）
+            stock_name: str = content.get("name") or ""
+            st_pattern = re.compile(r"(ST|S\*ST|\*ST|退市?|暂停上市)")
             is_st: bool = bool(st_pattern.search(stock_name))
 
             # 计算净利润同比增长率
             # 按时间降序：q0=最新季度，q1=去年同季度
+            # 【修复】原来按 period 字符串匹配，但最新季度 period 写成 '06-30'
+            # 而历史季度是 '0630'，格式不一致导致永远匹配不上。改为解析季度月份比较。
             def same_period_q1() -> Optional[Dict[str, Any]]:
-                if len(recent) < 2:
+                q0_month_m: Optional[int] = _quarter_month(recent[0])
+                q0_year_m: Optional[int] = _quarter_year(recent[0])
+                if q0_month_m is None or q0_year_m is None:
                     return None
-                q0_period: str = recent[0].get("period", "")
-                q0_year: int = recent[0].get("year", 0)
                 for q in recent[1:]:
-                    if q.get("period") == q0_period and q.get("year") == q0_year - 1:
+                    if (
+                        _quarter_month(q) == q0_month_m
+                        and _quarter_year(q) == q0_year_m - 1
+                    ):
                         return q
                 return None
 
             q1: Optional[Dict[str, Any]] = same_period_q1()
             net_profit_yoy: Optional[float] = None
 
-            if q1:
-                np0: Optional[float] = get_q(0, "归母净利润")
-                np1_val: Any = q1.get("归母净利润")
-                if (
-                    np1_val
-                    and isinstance(np1_val, (int, float))
-                    and np1_val != 0
-                ):
-                    np1_float: float = float(np1_val)
-                    net_profit_yoy = (np0 - np1_float) / abs(np1_float) * 100
+            if q1 and net_profit is not None:
+                np1: Optional[float] = _as_float(q1.get("归母净利润"))
+                # 去年同期为负(亏损)或 0 时，同比增长率在财务上没有意义
+                # （亏损转盈利会算出 46000% 这类假象），此时置为 None 不参与评分。
+                if np1 and np1 > 0:
+                    net_profit_yoy = (net_profit - np1) / abs(np1) * 100
 
             data: Dict[str, Any] = {
                 "code": symbol,
                 "name": stock_name,
                 "roe": roe,
+                "roe_annualized": roe_annualized,
                 "净利润": net_profit,
+                "report_period_month": q0_month,
                 "资产负债率": debt_ratio,
                 "净利润增长率": net_profit_yoy,
                 "is_st": is_st,
@@ -194,6 +307,62 @@ class FiscalDataFetcher:
             logger.warning(f"读取财务文件失败 {symbol}: {e}")
             return None
 
+    def get_float_shares(self, symbol: str) -> Optional[float]:
+        """获取流通股本（股），用于计算真实换手率
+
+        本地 K 线数据不含 turnover 字段，若用固定 1e8 股本粗估换手率，
+        实测 98% 的股票会被高估 2 倍以上。这里从财务文件取真实股本。
+
+        取值口径（按优先级）：
+            1. 流通股本 —— 换手率的标准口径（成交量/流通股本）
+            2. 总股本   —— 仅当**所有季度都没有**流通股本时才退而求其次
+
+        【审查修复】原实现按季度从新到旧遍历，每个季度先取流通股本、再取总股本，
+        一旦最新季度有"总股本"就立即返回，会漏掉更早季度里可用的"流通股本"。
+        例：000002 最新季度流通股本为 None、总股本 1.19e10，更早季度流通股本
+        1.19e10 —— 口径混用会导致换手率被系统性低估。现在改为"先把所有季度的
+        流通股本扫完，一个都没有再用总股本"，保证口径统一。
+
+        Args:
+            symbol: 股票代码
+
+        Returns:
+            流通/总股本（股），取不到返回 None
+        """
+        if symbol in self._shares_cache:
+            return self._shares_cache[symbol]
+
+        fpath: Path = self.fiscal_dir / f"{symbol}.json"
+        result: Optional[float] = None
+
+        if fpath.exists():
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content: Dict[str, Any] = json.load(f)
+                fiscal_list: List[Dict[str, Any]] = sorted(
+                    content.get("fiscal", []),
+                    key=lambda x: x.get("report_date", ""),
+                    reverse=True,
+                )
+                # 第一轮：只认"流通股本"（换手率标准口径），按时间从新到旧
+                for q in fiscal_list:
+                    shares: Optional[float] = _as_float(q.get("流通股本"))
+                    if shares and shares > 0:
+                        result = shares
+                        break
+                # 第二轮：所有季度都没有流通股本时，才退回"总股本"
+                if result is None:
+                    for q in fiscal_list:
+                        shares = _as_float(q.get("总股本"))
+                        if shares and shares > 0:
+                            result = shares
+                            break
+            except Exception as e:
+                logger.warning(f"读取股本失败 {symbol}: {e}")
+
+        self._shares_cache[symbol] = result
+        return result
+
     def check_financial(
         self, symbol: str, stock_type: str = "mid_long"
     ) -> Dict[str, Any]:
@@ -201,7 +370,8 @@ class FiscalDataFetcher:
 
         Args:
             symbol: 股票代码
-            stock_type: 'mid_long' 中长线 / 其他（短线不查财务）
+            stock_type: 'mid_long' 中长线（严格财务筛选）
+                       / 其他（超短线，仅做风险排除）
 
         Returns:
             {
@@ -214,11 +384,13 @@ class FiscalDataFetcher:
         """
         data: Optional[Dict[str, Any]] = self.get_fiscal_data(symbol)
 
+        # 超短线不做基本面筛选：没有财务数据不代表公司有问题（新股/次新/数据缺失），
+        # 短线交易不应因缺少财务文件而被淘汰。ST 风险检查仍照常做。
         if not data:
             return {
-                "pass": False,
+                "pass": stock_type != "mid_long",
                 "score": 0,
-                "reasons": ["无财务数据"],
+                "reasons": [] if stock_type != "mid_long" else ["无财务数据"],
                 "warnings": [],
                 "details": {},
             }
@@ -227,7 +399,7 @@ class FiscalDataFetcher:
         reasons: List[str] = []
         warnings: List[str] = []
 
-        # ST 股票直接淘汰
+        # ST 股票直接淘汰（对中长线和超短线都是硬风险）
         if data.get("is_st"):
             return {
                 "pass": False,
@@ -238,7 +410,11 @@ class FiscalDataFetcher:
             }
 
         # 提取核心指标
-        roe: Optional[float] = data.get("roe")
+        # ROE 评分统一使用"年化 ROE"：财务数据里归母净利润是年初至今累计值，
+        # 而评分阈值(20%/15%/10%)是年度口径，不年化会导致量级偏低而被误杀。
+        roe: Optional[float] = data.get("roe_annualized")
+        if roe is None:
+            roe = data.get("roe")
         profit_growth: Optional[float] = data.get("净利润增长率")
 
         # 中长线硬性淘汰条件
