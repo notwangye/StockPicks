@@ -17,7 +17,7 @@ COPY requirements.txt .
 
 # 升级 pip + 安装依赖
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-backend.txt
 
 # 复制后端代码
 COPY backend/ ./backend/
@@ -31,7 +31,7 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=5001 \
     HOST=0.0.0.0 \
     DEBUG=false \
-    STOCK_PICKS_DATA=/app/data/historical \
+    STOCK_PICKS_DATA=/app/data \
     STOCK_PICKS_FISCAL=/app/data/fiscal
 
 # 暴露端口
