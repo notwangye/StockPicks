@@ -43,7 +43,7 @@
 ### One-Click (Docker)
 
 ```bash
-git clone https://github.com/wadewen1221/StockPicks.git
+git clone https://github.com/notwangye/StockPicks.git
 cd StockPicks
 docker-compose up -d
 # Frontend: http://localhost:8080
@@ -53,11 +53,11 @@ docker-compose up -d
 ### Development Mode
 
 ```bash
-git clone https://github.com/wadewen1221/StockPicks.git
+git clone https://github.com/notwangye/StockPicks.git
 cd StockPicks
-pip install -r requirements.txt
+pip install -r requirements-backend.txt
 cd frontend && npm install && cd ..
-python backend/start_v2.py  # http://localhost:5001
+cd backend && python main.py  # http://localhost:5001
 ```
 
 ### Production Deployment
@@ -226,7 +226,7 @@ If this project helps you, a star would be appreciated!
 ### 一键启动（Docker）
 
 ```bash
-git clone https://github.com/wadewen1221/StockPicks.git
+git clone https://github.com/notwangye/StockPicks.git
 cd StockPicks
 docker-compose up -d
 # 前端: http://localhost:8080
@@ -236,9 +236,9 @@ docker-compose up -d
 ### 开发模式
 
 ```bash
-git clone https://github.com/wadewen1221/StockPicks.git
+git clone https://github.com/notwangye/StockPicks.git
 cd StockPicks
-pip install -r requirements.txt
+pip install -r requirements-backend.txt
 cd frontend && npm install && cd ..
 python backend/start_v2.py  # http://localhost:5001
 ```
