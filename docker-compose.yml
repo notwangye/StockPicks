@@ -31,7 +31,7 @@ services:
       DEBUG: "false"
       PYTHONUNBUFFERED: "1"
       # === 数据目录（容器内路径，挂载到 volume）===
-      STOCK_PICKS_DATA: "/app/data/historical"
+      STOCK_PICKS_DATA: "/app/data"
       STOCK_PICKS_FISCAL: "/app/data/fiscal"
       # === 可选：自定义环境变量（取消注释使用）===
       # STOCK_PICKS_TENCENT_COOKIE: "your_cookie_here"
