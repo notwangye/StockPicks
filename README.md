@@ -45,9 +45,12 @@
 ```bash
 git clone https://github.com/notwangye/StockPicks.git
 cd StockPicks
-docker-compose up -d
+cp .env.example .env
+# In .env: replace COOKIE_SECRET with a secure random value; set ALLOWED_ORIGINS
+# e.g. python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+docker compose up -d --build
 # Frontend: http://localhost:8080
-# Backend API: http://localhost:5001/api/health
+# Backend API: http://127.0.0.1:5001/api/health
 ```
 
 ### Development Mode
