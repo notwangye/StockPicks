@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖文件（利用 Docker 缓存，requirements 没变就不重装）
-COPY requirements.txt .
+COPY requirements-backend.txt .
 
 # 升级 pip + 安装依赖
 RUN pip install --no-cache-dir --upgrade pip && \
