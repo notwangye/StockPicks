@@ -60,7 +60,7 @@ services:
     container_name: stock-picks-frontend
     restart: unless-stopped
     ports:
-      - "8080:80"            # 暴露 8080 端口（避免与常见 80 冲突）
+      - "127.0.0.1:8080:80"  # 私有访问：仅本机，配合 SSH 隧道
     depends_on:
       backend:
         condition: service_healthy   # 等后端健康后再启动
