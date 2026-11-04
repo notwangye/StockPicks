@@ -23,12 +23,14 @@ services:
     container_name: stock-picks-backend
     restart: unless-stopped
     ports:
-      - "5001:5001"          # 暴露 5001 端口到宿主机
+      - "127.0.0.1:5001:5001"          # 暴露 5001 端口到宿主机
     environment:
       # === 基础配置 ===
       HOST: "0.0.0.0"
       PORT: "5001"
       DEBUG: "false"
+      COOKIE_SECRET: "${COOKIE_SECRET:?Set COOKIE_SECRET in an untracked .env before deployment}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:8080}"
       PYTHONUNBUFFERED: "1"
       # === 数据目录（容器内路径，挂载到 volume）===
       STOCK_PICKS_DATA: "/app/data"
